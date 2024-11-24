@@ -1,8 +1,6 @@
-// internal/client/client.go
 package client
 
 import (
-	"bytes"
 	"context"
 	"crypto/cipher"
 	"crypto/rand"
@@ -48,6 +46,7 @@ type Client struct {
 	assignedIP        net.IP
 	subnetMask        net.IPMask
 	oldDefaultGateway string
+	ip                net.IP
 }
 
 func NewClient(cfg *config.Config) (*Client, error) {
@@ -96,10 +95,11 @@ func (c *Client) Start() error {
 	}
 
 	// Запускаем обработчики пакетов
-	c.wg.Add(3)
+	c.wg.Add(4)
 	go c.handleTunToUDP()
 	go c.handleUDPToTun()
 	go c.keepalive()
+	go c.processTUNPackets()
 
 	// Ждем завершения
 	<-c.ctx.Done()
@@ -364,6 +364,7 @@ func (c *Client) performHandshake() error {
 	c.serverNonce = response.ServerNonce
 	c.assignedIP = net.IP(response.AssignedIP[:])
 	c.subnetMask = net.IPMask(response.SubnetMask[:])
+	c.ip = c.assignedIP
 
 	if c.assignedIP[len(c.assignedIP)-1] == 0 {
 		return fmt.Errorf("received invalid IP address: %s", c.assignedIP)
@@ -512,126 +513,169 @@ func calculateICMPChecksum(data []byte) uint16 {
 func (c *Client) configureRoutes() error {
 	log.Printf("Configuring routes...")
 
-	// 1. Получаем информацию о Wi-Fi
-	cmd := exec.Command("powershell", "-Command", `
-        $wifi = Get-NetAdapter | Where-Object {$_.Status -eq "Up" -and ($_.InterfaceDescription -like "*Wi-Fi*" -or $_.InterfaceDescription -like "*Wireless*")} | Select-Object -First 1
-        $gateway = (Get-NetIPConfiguration -InterfaceIndex $wifi.InterfaceIndex).IPv4DefaultGateway.NextHop
-        Write-Host $gateway
-    `)
+	// 1. Принудительно включаем TAP интерфейс
+	cmd := exec.Command("netsh", "interface", "set", "interface", c.config.TunName, "admin=enabled")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		log.Printf("Warning: failed to enable TAP interface: %v, output: %s", err, output)
+	}
+	time.Sleep(1 * time.Second)
+
+	// 2. Получаем информацию о Wi-Fi и текущем шлюзе
+	cmd = exec.Command("powershell", "-Command", `
+		$wifi = Get-NetAdapter | Where-Object {$_.Status -eq "Up" -and ($_.InterfaceDescription -like "*Wi-Fi*" -or $_.InterfaceDescription -like "*Wireless*")} | Select-Object -First 1
+		$config = Get-NetIPConfiguration -InterfaceIndex $wifi.InterfaceIndex
+		$gateway = $config.IPv4DefaultGateway.NextHop
+		$metric = $config.IPv4DefaultGateway.RouteMetric
+		Write-Host "$gateway|$($wifi.InterfaceIndex)|$metric"
+	`)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("failed to get Wi-Fi gateway: %v", err)
+		return fmt.Errorf("failed to get Wi-Fi info: %v", err)
 	}
-	wifiGateway := strings.TrimSpace(string(output))
+	parts := strings.Split(strings.TrimSpace(string(output)), "|")
+	if len(parts) != 3 {
+		return fmt.Errorf("invalid Wi-Fi info format")
+	}
+	wifiGateway := parts[0]
+	wifiMetric := parts[2]
 	c.oldDefaultGateway = wifiGateway
 
-	// 2. Отключаем IPv6 на TAP
-	cmd = exec.Command("netsh", "interface", "ipv6", "set", "interface", c.config.TunName, "disabled")
+	// 3. Получаем индекс TAP интерфейса
+	cmd = exec.Command("powershell", "-Command", `
+		$tap = Get-NetAdapter | Where-Object { $_.Name -eq '`+c.config.TunName+`' }
+		Write-Host $tap.InterfaceIndex
+	`)
+	output, err = cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to get TAP interface index: %v", err)
+	}
+	tapIndex := strings.TrimSpace(string(output))
+
+	// 4. Очищаем существующие маршруты через PowerShell для большей надежности
+	cmd = exec.Command("powershell", "-Command", `
+		Remove-NetRoute -InterfaceIndex `+tapIndex+` -Confirm:$false -ErrorAction SilentlyContinue
+	`)
 	cmd.Run()
+	time.Sleep(500 * time.Millisecond)
 
-	// 3. Полностью очищаем таблицу маршрутизации для VPN и маршрута по умолчанию
-	cleanupCommands := []string{
-		// Удаляем все маршруты к VPN сети
-		"route delete 10.0.0.0 mask 255.255.255.0",
-		// Удаляем маршрут по умолчанию
-		"route delete 0.0.0.0 mask 0.0.0.0",
-		// Удаляем маршрут к серверу VPN
-		fmt.Sprintf("route delete %s", strings.Split(c.config.ServerAddr, ":")[0]),
-	}
-
-	for _, cmdStr := range cleanupCommands {
-		exec.Command("cmd", "/C", cmdStr).Run()
-	}
-	time.Sleep(time.Second)
-
-	// 4. Настраиваем маршруты
+	// 5. Настраиваем маршруты с правильными метриками
 	serverHost := strings.Split(c.config.ServerAddr, ":")[0]
-	routes := [][]string{
-		// Маршрут к серверу VPN через Wi-Fi с низкой метрикой
-		{"add", "-p", serverHost, "mask", "255.255.255.255", wifiGateway, "metric", "1"},
-		// Маршрут к VPN сети
-		{"add", "-p", "10.0.0.0", "mask", "255.255.255.0", "10.0.0.1", "metric", "1"},
-		// Маршрут по умолчанию через VPN
-		{"add", "-p", "0.0.0.0", "mask", "0.0.0.0", "10.0.0.1", "metric", "1"},
+	vpnMetric := "1" // VPN маршруты должны иметь более низкую метрику
+
+	routes := []struct {
+		args []string
+		desc string
+	}{
+		{
+			args: []string{"add", serverHost, "mask", "255.255.255.255", wifiGateway, "metric", wifiMetric},
+			desc: "server route",
+		},
+		{
+			args: []string{"add", "10.0.0.0", "mask", "255.255.255.0", "10.0.0.1", "metric", vpnMetric, "if", tapIndex},
+			desc: "VPN network route",
+		},
+		{
+			args: []string{"add", "0.0.0.0", "mask", "0.0.0.0", "10.0.0.1", "metric", vpnMetric, "if", tapIndex},
+			desc: "default route",
+		},
 	}
 
 	for _, route := range routes {
-		cmd = exec.Command("route", route...)
+		cmd = exec.Command("route", route.args...)
 		if output, err := cmd.CombinedOutput(); err != nil {
-			log.Printf("Warning: failed to add route %v: %v, output: %s", route, err, output)
-			// Пробуем без флага -p, если не получилось
-			route = append(route[:1], route[2:]...)
-			cmd = exec.Command("route", route...)
+			log.Printf("Failed to add %s: %v, output: %s", route.desc, err, output)
+			// Пробуем альтернативный вариант без метрики
+			altArgs := route.args[:len(route.args)-2] // Убираем метрику и индекс интерфейса
+			cmd = exec.Command("route", altArgs...)
 			if output, err = cmd.CombinedOutput(); err != nil {
-				log.Printf("Error: failed to add route without -p: %v, output: %s", err, output)
+				return fmt.Errorf("failed to add %s: %v", route.desc, err)
 			}
 		}
-		time.Sleep(time.Second)
+		time.Sleep(200 * time.Millisecond)
 	}
 
-	// 5. Настраиваем DNS
-	cmd = exec.Command("netsh", "interface", "ip", "set", "dns", c.config.TunName, "static", "8.8.8.8", "primary")
-	cmd.Run()
-	cmd = exec.Command("netsh", "interface", "ip", "add", "dns", c.config.TunName, "8.8.4.4", "index=2")
-	cmd.Run()
+	// 6. Настраиваем DNS через PowerShell для большей надежности
+	cmd = exec.Command("powershell", "-Command", `
+        Set-DnsClientServerAddress -InterfaceIndex `+tapIndex+` -ResetServerAddresses
+    `)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		log.Printf("Warning: failed to reset DNS servers: %v, output: %s", err, output)
+	}
 
-	// 6. Отключаем автоматическую метрику для TAP интерфейса
-	cmd = exec.Command("netsh", "interface", "ip", "set", "interface", c.config.TunName, "metric=1")
-	cmd.Run()
-
-	// 7. Принудительно включаем TAP интерфейс
-	cmd = exec.Command("netsh", "interface", "set", "interface", c.config.TunName, "admin=enabled")
-	cmd.Run()
-
-	// 8. Сбрасываем DNS-кэш
+	// 7. Сбрасываем DNS-кэш
 	exec.Command("ipconfig", "/flushdns").Run()
 
-	// 9. Выводим текущие маршруты для проверки
-	cmd = exec.Command("route", "print")
-	if output, err := cmd.CombinedOutput(); err == nil {
-		log.Printf("Current routing table:\n%s", string(output))
+	// 8. Проверяем состояние маршрутизации
+	if !c.verifyRoutes() {
+		return fmt.Errorf("route verification failed")
 	}
 
-	return nil
-}
-
-func (c *Client) checkDNS() error {
-	cmd := exec.Command("nslookup", "google.com", "8.8.8.8")
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("DNS check failed: %v, output: %s", err, output)
-	}
 	return nil
 }
 
 func (c *Client) verifyRoutes() bool {
-	// Проверяем все критические маршруты
-	routes := []struct {
-		network string
-		gateway string
-	}{
-		{"0.0.0.0", "10.0.0.1"},
-		{"10.0.0.0", "10.0.0.1"},
-		{strings.Split(c.config.ServerAddr, ":")[0], c.oldDefaultGateway},
-	}
-
-	for _, route := range routes {
-		cmd := exec.Command("route", "print", route.network)
-		output, err := cmd.CombinedOutput()
-		if err != nil || !strings.Contains(string(output), route.gateway) {
-			log.Printf("Route verification failed for %s via %s", route.network, route.gateway)
-			return false
-		}
-	}
-
-	// Проверяем, что TAP интерфейс активен
-	cmd := exec.Command("netsh", "interface", "show", "interface", c.config.TunName)
+	// Получаем полную таблицу маршрутизации
+	cmd := exec.Command("route", "print")
 	output, err := cmd.CombinedOutput()
-	if err != nil || !strings.Contains(string(output), "enabled") {
-		log.Printf("TAP interface verification failed")
+	if err != nil {
+		log.Printf("Failed to get routing table: %v", err)
+		return false
+	}
+	
+	routeTable := string(output)
+	log.Printf("Current routing table:\n%s", routeTable)
+
+	// Проверяем состояние TAP интерфейса через PowerShell
+	cmd = exec.Command("powershell", "-Command", `
+		$adapter = Get-NetAdapter | Where-Object { $_.Name -eq '`+c.config.TunName+`' }
+		if ($adapter.Status -eq 'Up') { 
+			Write-Host "UP"
+		} else {
+			Write-Host "DOWN"
+		}
+	`)
+	
+	output, err = cmd.CombinedOutput()
+	if err != nil || !strings.Contains(string(output), "UP") {
+		log.Printf("TAP interface is not up: %v, status: %s", err, string(output))
 		return false
 	}
 
-	return true
+	// Проверяем наличие критических маршрутов
+	requiredRoutes := []struct {
+		network string
+		gateway string
+		desc    string
+	}{
+		{"0.0.0.0", "10.0.0.1", "default route"},
+		{"10.0.0.0", "10.0.0.1", "VPN network"},
+		{strings.Split(c.config.ServerAddr, ":")[0], c.oldDefaultGateway, "VPN server"},
+	}
+
+	success := true
+	for _, route := range requiredRoutes {
+		found := false
+		lines := strings.Split(routeTable, "\n")
+		for _, line := range lines {
+			if strings.Contains(line, route.network) && strings.Contains(line, route.gateway) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			log.Printf("Missing required %s: network=%s, gateway=%s", 
+				route.desc, route.network, route.gateway)
+			success = false
+		}
+	}
+
+	if !success {
+		log.Printf("Route verification failed. Please check the routing table above for details.")
+	} else {
+		log.Printf("Route verification successful")
+	}
+
+	return success
 }
 
 func getDefaultRouteWindows() (*Route, error) {
@@ -665,10 +709,21 @@ func getDefaultRouteWindows() (*Route, error) {
 }
 
 func (c *Client) cleanup() error {
-	log.Printf("Cleaning up routes...")
+	log.Printf("Cleaning up...")
+
+	// Восстанавливаем оригинальные DNS настройки
+	cmd := exec.Command("powershell", "-Command", `
+		if (Test-Path "$env:TEMP\original_dns.txt") {
+			$dns = Get-Content "$env:TEMP\original_dns.txt"
+			$adapter = Get-NetAdapter | Where-Object {$_.Name -eq '`+c.config.TunName+`'}
+			Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ServerAddresses $dns
+			Remove-Item "$env:TEMP\original_dns.txt"
+		}
+	`)
+	cmd.Run()
 
 	// 1. Удаляем маршрут по умолчанию через VPN
-	cmd := exec.Command("route", "delete", "0.0.0.0", "mask", "0.0.0.0")
+	cmd = exec.Command("route", "delete", "0.0.0.0", "mask", "0.0.0.0")
 	cmd.Run()
 	time.Sleep(time.Second)
 
@@ -701,33 +756,47 @@ func (c *Client) cleanup() error {
 	return nil
 }
 
+func (c *Client) checkDNS() error {
+	cmd := exec.Command("nslookup", "google.com", "8.8.8.8")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("DNS check failed: %v, output: %s", err, output)
+	}
+	return nil
+}
+
 func (c *Client) checkConnection() error {
 	// Даем время на применение настроек
 	time.Sleep(3 * time.Second)
 
 	// Сначала проверяем связь с VPN сервером через Wi-Fi
 	serverHost := strings.Split(c.config.ServerAddr, ":")[0]
-	cmd := exec.Command("ping", "-n", "1", "-w", "2000", serverHost)
+	cmd := exec.Command("ping", "-n", "1", "-w", "3000", serverHost)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		log.Printf("VPN server ping failed: %v, output: %s", err, output)
-		return fmt.Errorf("VPN server unreachable")
-	}
+		
+		// 2. Проверяем состояние TAP интерфейса
+		cmd = exec.Command("powershell", "-Command", `
+			$tap = Get-NetAdapter | Where-Object { $_.Name -eq '`+c.config.TunName+`' }
+			Write-Host "Status: $($tap.Status)"
+			Write-Host "Link Speed: $($tap.LinkSpeed)"
+			Write-Host "Media Status: $($tap.MediaConnectionState)"
+		`)
+		
+		output, err = cmd.CombinedOutput()
+		if err == nil {
+			log.Printf("TAP interface status:\n%s", output)
+		}
 
-	// Проверяем DNS
-	cmd = exec.Command("nslookup", "google.com", "8.8.8.8")
-	if output, err := cmd.CombinedOutput(); err != nil {
-		log.Printf("DNS test failed: %v, output: %s", err, output)
-		return fmt.Errorf("DNS resolution not working")
-	}
+		// 3. Проверяем маршруты до VPN шлюза
+		cmd = exec.Command("tracert", "-d", "-h", "5", "10.0.0.1")
+		if output, err := cmd.CombinedOutput(); err == nil {
+			log.Printf("Route to VPN gateway:\n%s", output)
+		}
 
-	// Проверяем VPN туннель
-	cmd = exec.Command("ping", "-n", "1", "-w", "2000", "10.0.0.1")
-	if output, err := cmd.CombinedOutput(); err != nil {
-		log.Printf("VPN gateway ping failed: %v, output: %s", err, output)
 		return fmt.Errorf("VPN tunnel not working")
 	}
 
-	log.Printf("Connection test successful")
+	log.Printf("VPN tunnel is working")
 	return nil
 }
 
@@ -758,103 +827,94 @@ func CheckAdminPrivileges() error {
 
 func (c *Client) handleTunToUDP() {
 	defer c.wg.Done()
+	buffer := make([]byte, 2048)
 
-	buffer := make([]byte, c.config.MTU)
 	for {
 		select {
 		case <-c.ctx.Done():
 			return
 		default:
-		}
-
-		// Читаем пакет из TUN
-		n, err := c.tunDevice.Read(buffer)
-		if err != nil {
-			if c.ctx.Err() != nil {
-				return
+			n, err := c.tunDevice.Read(buffer)
+			if err != nil {
+				if c.ctx.Err() == nil {
+					log.Printf("Error reading from TUN: %v", err)
+				}
+				continue
 			}
-			log.Printf("Error reading from TUN: %v", err)
-			continue
-		}
 
-		// Добавляем логирование для отладки
-		log.Printf("Read %d bytes from TUN", n)
-		if n >= 20 {
-			srcIP := net.IP(buffer[12:16])
-			dstIP := net.IP(buffer[16:20])
-			log.Printf("Packet from TUN: src=%s dst=%s", srcIP, dstIP)
-		}
+			packet := buffer[:n]
+			if len(packet) < 20 {
+				log.Printf("Packet too short")
+				continue
+			}
 
-		packet := buffer[:n]
+			// Проверяем и исправляем версию IP
+			version := packet[0] >> 4
+			if version != 4 {
+				packet[0] = 0x45
+				log.Printf("Fixed IP version to IPv4")
+			}
 
-		// Проверяем и фиксируем IP-пакет
-		packet, ok := c.validateAndFixIPPacket(packet)
-		if !ok {
-			continue
-		}
+			// Получаем и проверяем IP адреса
+			srcIP := net.IP(packet[12:16])
+			dstIP := net.IP(packet[16:20])
 
-		// Создаем nonce для шифрования
-		nonce := make([]byte, chacha20poly1305.NonceSize)
-		copy(nonce, c.clientNonce[:])
-		binary.BigEndian.PutUint64(nonce[len(nonce)-8:], c.sequenceNum)
+			// Проверяем и исправляем IP источника
+			_, vpnNet, _ := net.ParseCIDR("10.0.0.0/24")
+			if !vpnNet.Contains(srcIP) {
+				copy(packet[12:16], c.assignedIP.To4())
+				log.Printf("Fixed source IP from %s to %s", srcIP, c.assignedIP)
+			}
 
-		// Шифруем пакет
-		encrypted := c.aead.Seal(nil, nonce, packet, nil)
+			// Проверяем IP назначения
+			if dstIP == nil || dstIP.To4() == nil || dstIP.IsLoopback() || dstIP.IsMulticast() || dstIP[0] == 0 {
+				log.Printf("Invalid destination IP: %s, dropping packet", dstIP)
+				continue
+			}
 
-		// Создаем заголовок
-		header := &protocol.PacketHeader{
-			Version:     protocol.ProtocolVersion,
-			Type:        protocol.PacketTypeData,
-			SequenceNum: c.sequenceNum,
-			PayloadSize: uint32(len(encrypted)),
-		}
+			// Пересчитываем контрольную сумму
+			packet[10] = 0
+			packet[11] = 0
+			var sum uint32
+			for i := 0; i < 20; i += 2 {
+				sum += uint32(packet[i])<<8 | uint32(packet[i+1])
+			}
+			for sum>>16 != 0 {
+				sum = (sum & 0xFFFF) + (sum >> 16)
+			}
+			checksum := ^uint16(sum)
+			packet[10] = byte(checksum >> 8)
+			packet[11] = byte(checksum)
 
-		// Увеличиваем sequence number
-		c.sequenceNum++
+			// Создаем nonce для шифрования
+			nonce := make([]byte, chacha20poly1305.NonceSize)
+			copy(nonce, c.clientNonce[:])
+			binary.BigEndian.PutUint64(nonce[len(nonce)-8:], c.sequenceNum)
 
-		// Формируем полный пакет
-		fullPacket := append(header.Marshal(), encrypted...)
+			// Шифруем пакет
+			encrypted := c.aead.Seal(nil, nonce, packet, nil)
 
-		// Отправляем пакет
-		log.Printf("Sending %d bytes to UDP", len(fullPacket))
-		if _, err := c.udpConn.WriteToUDP(fullPacket, c.serverAddr); err != nil {
-			log.Printf("Error sending UDP packet: %v", err)
+			// Создаем заголовок пакета
+			header := &protocol.PacketHeader{
+				Version:     protocol.ProtocolVersion,
+				Type:        protocol.PacketTypeData,
+				SequenceNum: c.sequenceNum,
+				PayloadSize: uint32(len(encrypted)),
+			}
+
+			// Увеличиваем sequence number
+			c.sequenceNum++
+
+			// Формируем полный пакет
+			fullPacket := append(header.Marshal(), encrypted...)
+
+			log.Printf("Sending encrypted packet: src=%s dst=%s, size=%d", srcIP, dstIP, len(fullPacket))
+			_, err = c.udpConn.WriteToUDP(fullPacket, c.serverAddr)
+			if err != nil {
+				log.Printf("Error sending packet to server: %v", err)
+			}
 		}
 	}
-}
-
-func (c *Client) validateAndFixIPPacket(packet []byte) ([]byte, bool) {
-	if len(packet) < 20 {
-		log.Printf("Packet too small: %d bytes", len(packet))
-		return nil, false
-	}
-
-	// Проверяем и исправляем версию IP
-	version := packet[0] >> 4
-	if version != 4 {
-		log.Printf("Invalid IP version: %d, fixing to IPv4", version)
-		packet[0] = (packet[0] & 0x0F) | 0x40
-	}
-
-	// Всегда проверяем и исправляем IP-адрес источника на назначенный нам IP
-	if !bytes.Equal(packet[12:16], c.assignedIP.To4()) {
-		log.Printf("Fixing source IP from %v to %v", net.IP(packet[12:16]), c.assignedIP)
-		copy(packet[12:16], c.assignedIP.To4())
-	}
-
-	// Проверяем IP назначения - должен быть в сети 10.0.0.0/24
-	dstIP := net.IP(packet[16:20])
-	if !bytes.Equal(dstIP[:2], []byte{10, 0}) {
-		log.Printf("Invalid destination IP: %v, dropping packet", dstIP)
-		return nil, false
-	}
-
-	// Пересчитываем контрольную сумму IP заголовка
-	binary.BigEndian.PutUint16(packet[10:12], 0)
-	checksum := calculateIPChecksum(packet[:20])
-	binary.BigEndian.PutUint16(packet[10:12], checksum)
-
-	return packet, true
 }
 
 func (c *Client) handleUDPToTun() {
@@ -981,4 +1041,185 @@ func logRoutes() {
 	if output, err := cmd.CombinedOutput(); err == nil {
 		log.Printf("Current routes:\n%s", string(output))
 	}
+}
+
+func (c *Client) processTUNPackets() {
+	defer c.wg.Done()
+	buffer := make([]byte, 2048)
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		default:
+			n, err := c.tunDevice.Read(buffer)
+			if err != nil {
+				if c.ctx.Err() == nil {
+					log.Printf("Error reading from TUN: %v", err)
+				}
+				continue
+			}
+
+			packet := buffer[:n]
+			log.Printf("Read %d bytes from TUN", n)
+
+			// Обрабатываем пакет перед анализом
+			if err := c.handleTUNPacket(packet); err != nil {
+				continue
+			}
+
+			// Анализируем пакет
+			if len(packet) >= 20 {
+				srcIP := net.IP(packet[12:16])
+				dstIP := net.IP(packet[16:20])
+				log.Printf("Packet from TUN: src=%s dst=%s", srcIP, dstIP)
+
+				// Отправляем пакет на сервер
+				if err := c.sendPacketToServer(packet); err != nil {
+					log.Printf("Error sending packet to server: %v", err)
+				}
+			}
+		}
+	}
+}
+
+func (c *Client) sendPacketToServer(packet []byte) error {
+	// Создаем nonce для шифрования
+	nonce := make([]byte, chacha20poly1305.NonceSize)
+	copy(nonce, c.clientNonce[:])
+	binary.BigEndian.PutUint64(nonce[len(nonce)-8:], c.sequenceNum)
+
+	// Шифруем пакет
+	encrypted := c.aead.Seal(nil, nonce, packet, nil)
+
+	// Создаем заголовок пакета
+	header := &protocol.PacketHeader{
+		Version:     protocol.ProtocolVersion,
+		Type:        protocol.PacketTypeData,
+		SequenceNum: c.sequenceNum,
+		PayloadSize: uint32(len(encrypted)),
+	}
+	c.sequenceNum++
+
+	// Формируем полный пакет
+	fullPacket := append(header.Marshal(), encrypted...)
+
+	// Отправляем на сервер
+	_, err := c.udpConn.WriteToUDP(fullPacket, c.serverAddr)
+	if err != nil {
+		return fmt.Errorf("failed to send packet: %v", err)
+	}
+
+	return nil
+}
+
+func (c *Client) handleTUNPacket(packet []byte) error {
+	if len(packet) < 20 {
+		return fmt.Errorf("packet too short")
+	}
+
+	// Проверяем и исправляем версию IP
+	version := packet[0] >> 4
+	if version != 4 {
+		// Устанавливаем версию IPv4 (0x45 = IPv4 + стандартный заголовок)
+		packet[0] = 0x45
+		log.Printf("Fixed IP version to IPv4")
+	}
+
+	// Получаем адреса источника и назначения
+	srcIP := net.IP(packet[12:16])
+	dstIP := net.IP(packet[16:20])
+
+	// Проверяем и исправляем IP источника если он не из нашей подсети
+	if !c.isInVPNSubnet(srcIP) {
+		copy(packet[12:16], c.ip.To4())
+		log.Printf("Fixed source IP from %s to %s", srcIP, c.ip)
+	}
+
+	// Проверяем IP назначения
+	if !c.isValidDestination(dstIP) {
+		log.Printf("Invalid destination IP: %s, dropping packet", dstIP)
+		return fmt.Errorf("invalid destination IP")
+	}
+
+	// Пересчитываем контрольную сумму IP-заголовка
+	c.recalculateIPChecksum(packet)
+
+	return nil
+}
+
+func (c *Client) isInVPNSubnet(ip net.IP) bool {
+	_, vpnNet, _ := net.ParseCIDR("10.0.0.0/24")
+	return vpnNet.Contains(ip)
+}
+
+func (c *Client) isValidDestination(ip net.IP) bool {
+	// Проверяем что это валидный IPv4 адрес
+	if ip == nil || ip.To4() == nil {
+		return false
+	}
+
+	// Проверяем что это не специальные адреса
+	if ip.IsLoopback() || ip.IsMulticast() || ip.IsLinkLocalUnicast() {
+		return false
+	}
+
+	// Проверяем что первый октет не 0
+	return ip[0] != 0
+}
+
+func (c *Client) recalculateIPChecksum(packet []byte) {
+	// Сбрасываем текущую контрольную сумму
+	packet[10] = 0
+	packet[11] = 0
+
+	// Считаем новую контрольную сумму
+	var sum uint32
+	for i := 0; i < 20; i += 2 {
+		sum += uint32(packet[i])<<8 | uint32(packet[i+1])
+	}
+
+	// Добавляем переносы
+	for sum>>16 != 0 {
+		sum = (sum & 0xFFFF) + (sum >> 16)
+	}
+
+	// Записываем новую контрольную сумму
+	checksum := ^uint16(sum)
+	packet[10] = byte(checksum >> 8)
+	packet[11] = byte(checksum)
+}
+
+func (c *Client) testTunnel() error {
+	log.Printf("Testing VPN tunnel...")
+
+	// 1. Пробуем пинг до шлюза VPN
+	cmd := exec.Command("ping", "-n", "1", "-w", "3000", "10.0.0.1")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		log.Printf("VPN gateway ping failed: %v, output: %s", err, output)
+		
+		// 2. Проверяем состояние TAP интерфейса
+		cmd = exec.Command("powershell", "-Command", `
+			$tap = Get-NetAdapter | Where-Object { $_.Name -eq '`+c.config.TunName+`' }
+			Write-Host "Status: $($tap.Status)"
+			Write-Host "Link Speed: $($tap.LinkSpeed)"
+			Write-Host "Media Status: $($tap.MediaConnectionState)"
+		`)
+		
+		output, err = cmd.CombinedOutput()
+		if err == nil {
+			log.Printf("TAP interface status:\n%s", output)
+		}
+
+		// 3. Проверяем маршруты до VPN шлюза
+		cmd = exec.Command("tracert", "-d", "-h", "5", "10.0.0.1")
+		if output, err := cmd.CombinedOutput(); err == nil {
+			log.Printf("Route to VPN gateway:\n%s", output)
+		}
+
+		return fmt.Errorf("VPN tunnel not working")
+	}
+
+	log.Printf("VPN tunnel is working")
+	return nil
 }
